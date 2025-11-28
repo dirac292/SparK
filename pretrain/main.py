@@ -139,7 +139,8 @@ def main_pt():
                 sys.stdout.isatty = lambda: False
             wandb.init(
                 project="ssl-pretraining",  # Change this to your project name
-                name=f"spark_{args.model}_10ep",
+                # name=f"spark_{args.model}_10ep",
+                name=args.exp_name,
                 entity="critical-ml-dg",
                 config=vars(args),
                 mode = "online"
