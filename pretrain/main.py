@@ -25,6 +25,9 @@ from utils import arg_util, misc, lamb
 from utils.imagenet import build_dataset_to_pretrain
 from utils.lr_control import lr_wd_annealing, get_param_groups
 
+import wandb
+import os
+
 
 class LocalDDP(torch.nn.Module):
     def __init__(self, module):
@@ -61,7 +64,47 @@ def main_pt():
         densify_norm=args.densify_norm, sbn=args.sbn,
     ).to(args.device)
     print(f'[PT model] model = {model_without_ddp}\n')
-    
+
+
+    if not args.resume_from: # Only load if not resuming from a checkpoint
+        print(f'=> HACK: Loading ImageNet-1K Supervised Weights into ResNetEncoder (sp_cnn)...')
+        import torchvision.models as models
+        
+        # 1. Load standard ResNet50 weights from torchvision (Dense weights)
+        # Note: 'weights="IMAGENET1K_V1"' is the modern equivalent of 'pretrained=True'
+        resnet_pretrained = models.resnet50(pretrained=True) 
+        pretrained_dict = resnet_pretrained.state_dict()
+        
+        # 2. Get the SparK backbone's state dict (Sparse weights container)
+        # The backbone is stored in 'sparse_encoder.sp_cnn'
+        target_model = model_without_ddp.sparse_encoder.sp_cnn
+        model_dict = target_model.state_dict()
+        
+        # 3. Filter and Remap Keys
+        # We exclude 'fc' (classification head) as SparK is an encoder-decoder
+        # We also ensure keys match the target model's expectations
+        new_state_dict = {}
+        for k, v in pretrained_dict.items():
+            if k in model_dict:
+                # Standard case: key names match exactly (e.g., conv1.weight)
+                if v.shape == model_dict[k].shape:
+                    new_state_dict[k] = v
+                else:
+                    print(f"   [Skipping] Shape mismatch for {k}: src {v.shape} vs dst {model_dict[k].shape}")
+            elif k.replace('module.', '') in model_dict:
+                 # Handle potential DDP prefix differences if source was saved differently
+                 clean_k = k.replace('module.', '')
+                 new_state_dict[clean_k] = v
+            else:
+                 # Typically 'fc.weight' and 'fc.bias' end up here
+                 pass
+
+        # 4. Load the filtered weights
+        # strict=False allows loading even if the head is missing (which is expected)
+        msg = target_model.load_state_dict(new_state_dict, strict=False)
+        print(f'=> HACK: ImageNet Weights Loaded. Missing keys (expected for head): {msg.missing_keys}')
+    # ==============================================================================
+
     # the model has been randomly initialized in their construction time
     # now try to load some checkpoint as model weight initialization; this ONLY loads the model weights
     misc.initialize_weight(args.init_weight, model_without_ddp)
@@ -88,6 +131,19 @@ def main_pt():
         print(f'  [*] [PT already done]    Min/Last Recon Loss: {performance_desc}')
     else:   # perform pre-training
         tb_lg = misc.TensorboardLogger(args.tb_lg_dir, is_master=dist.is_master(), prefix='pt')
+        if dist.is_master():
+
+            if not hasattr(sys.stderr, 'isatty'):
+                sys.stderr.isatty = lambda: False
+            if not hasattr(sys.stdout, 'isatty'):
+                sys.stdout.isatty = lambda: False
+            wandb.init(
+                project="ssl-pretraining",  # Change this to your project name
+                name=f"spark_{args.model}_10ep",
+                entity="critical-ml-dg",
+                config=vars(args),
+                mode = "online"
+            )
         min_loss = 1e9
         print(f'[PT start] from ep{ep_start}')
         
@@ -119,6 +175,14 @@ def main_pt():
             tb_lg.update(min_loss=min_loss, head='train', step=ep)
             tb_lg.update(rest_hours=round(remain_secs/60/60, 2), head='z_burnout', step=ep)
             tb_lg.flush()
+
+            # [INSERT THIS BLOCK] WandB Epoch Logging
+            if dist.is_master():
+                wandb.log({
+                    'epoch_min_loss': min_loss,
+                    'epoch_last_loss': last_loss,
+                    'hours_remaining': round(remain_secs/60/60, 2),
+                })
         
         # finish pre-training
         tb_lg.update(min_loss=min_loss, head='result', step=ep_start)
@@ -128,6 +192,8 @@ def main_pt():
         print('\n\n')
         print(f'  [*] [PT finished]    Min/Last Recon Loss: {performance_desc},    Total Cost: {(time.time() - pt_start_time) / 60 / 60:.1f}h\n')
         print('\n\n')
+        if dist.is_master():
+            wandb.finish()
         tb_lg.close()
         time.sleep(10)
     
@@ -177,6 +243,16 @@ def pre_train_one_ep(ep, args: arg_util.Args, tb_lg: misc.TensorboardLogger, itr
         tb_lg.update(sche_lr=min_lr, head='train_hp/lr_min')
         tb_lg.update(sche_wd=max_wd, head='train_hp/wd_max')
         tb_lg.update(sche_wd=min_wd, head='train_hp/wd_min')
+        if dist.is_master():
+            wandb.log({
+                'train_loss': me.meters['last_loss'].global_avg,
+                'lr_max': max_lr,
+                'lr_min': min_lr,
+                'wd_max': max_wd,
+                'grad_norm': grad_norm if grad_norm is not None else 0.0,
+                'epoch': ep,
+                'iter': it + ep * iters_train
+            })
         
         if grad_norm is not None:
             me.update(orig_norm=grad_norm)

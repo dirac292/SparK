@@ -27,58 +27,115 @@ def pil_loader(path):
     return img
 
 
-class ImageNetDataset(DatasetFolder):
-    def __init__(
-            self,
-            imagenet_folder: str,
-            train: bool,
-            transform: Callable,
-            is_valid_file: Optional[Callable[[str], bool]] = None,
-    ):
-        imagenet_folder = os.path.join(imagenet_folder, 'train' if train else 'val')
-        super(ImageNetDataset, self).__init__(
-            imagenet_folder,
-            loader=pil_loader,
-            extensions=IMG_EXTENSIONS if is_valid_file is None else None,
-            transform=transform,
-            target_transform=None, is_valid_file=is_valid_file
-        )
+# class ImageNetDataset(DatasetFolder):
+#     def __init__(
+#             self,
+#             imagenet_folder: str,
+#             train: bool,
+#             transform: Callable,
+#             is_valid_file: Optional[Callable[[str], bool]] = None,
+#     ):
+#         imagenet_folder = os.path.join(imagenet_folder, 'train' if train else 'val')
+#         super(ImageNetDataset, self).__init__(
+#             imagenet_folder,
+#             loader=pil_loader,
+#             extensions=IMG_EXTENSIONS if is_valid_file is None else None,
+#             transform=transform,
+#             target_transform=None, is_valid_file=is_valid_file
+#         )
+#
+#         self.samples = tuple(img for (img, label) in self.samples)
+#         self.targets = None # this is self-supervised learning so we don't need labels
+#
+#     def __getitem__(self, index: int) -> Any:
+#         img_file_path = self.samples[index]
+#         return self.transform(self.loader(img_file_path))
+#
+#
+# def build_dataset_to_pretrain(dataset_path, input_size) -> Dataset:
+#     """
+#     You may need to modify this function to return your own dataset.
+#     Define a new class, a subclass of `Dataset`, to replace our ImageNetDataset.
+#     Use dataset_path to build your image file path list.
+#     Use input_size to create the transformation function for your images, can refer to the `trans_train` blow. 
+#
+#     :param dataset_path: the folder of dataset
+#     :param input_size: the input size (image resolution)
+#     :return: the dataset used for pretraining
+#     """
+#     trans_train = transforms.Compose([
+#         transforms.RandomResizedCrop(input_size, scale=(0.67, 1.0), interpolation=interpolation),
+#         transforms.RandomHorizontalFlip(),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+#     ])
+#
+#     dataset_path = os.path.abspath(dataset_path)
+#     for postfix in ('train', 'val'):
+#         if dataset_path.endswith(postfix):
+#             dataset_path = dataset_path[:-len(postfix)]
+#
+#     dataset_train = ImageNetDataset(imagenet_folder=dataset_path, transform=trans_train, train=True)
+#     print_transform(trans_train, '[pre-train]')
+#     return dataset_train
+
+import glob
+
+class FlatFolderDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        # Grab all common image extensions
+        self.images = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif']:
+            self.images.extend(glob.glob(os.path.join(root, ext)))
+            self.images.extend(glob.glob(os.path.join(root, "**", ext), recursive=True)) # Recursive just in case
         
-        self.samples = tuple(img for (img, label) in self.samples)
-        self.targets = None # this is self-supervised learning so we don't need labels
-    
-    def __getitem__(self, index: int) -> Any:
-        img_file_path = self.samples[index]
-        return self.transform(self.loader(img_file_path))
+        # Sort to ensure consistent order across ranks in DDP
+        self.images = sorted(list(set(self.images))) 
+        
+        if len(self.images) == 0:
+            raise RuntimeError(f"Found 0 images in {root}")
+        
+        print(f"Found {len(self.images)} images in {root}")
 
+    def __len__(self):
+        return len(self.images)
 
+    def __getitem__(self, index):
+        path = self.images[index]
+        # Always convert to RGB for ResNet (even if medical images are grayscale)
+        with open(path, 'rb') as f:
+            img = PImage.open(f).convert('RGB')
+            
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        # Return dummy label '0' because pretraining doesn't need labels
+        return img
+
+# 2. Update the build function
 def build_dataset_to_pretrain(dataset_path, input_size) -> Dataset:
     """
-    You may need to modify this function to return your own dataset.
-    Define a new class, a subclass of `Dataset`, to replace our ImageNetDataset.
-    Use dataset_path to build your image file path list.
-    Use input_size to create the transformation function for your images, can refer to the `trans_train` blow. 
-    
-    :param dataset_path: the folder of dataset
-    :param input_size: the input size (image resolution)
-    :return: the dataset used for pretraining
+    Modified to use FlatFolderDataset for homogeneous medical data.
     """
+    # Standard ResNet pretraining transforms
     trans_train = transforms.Compose([
-        transforms.RandomResizedCrop(input_size, scale=(0.67, 1.0), interpolation=interpolation),
+        transforms.RandomResizedCrop(input_size, scale=(0.67, 1.0), interpolation=3), # 3 is BICUBIC
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
     ])
     
+    # Check if path exists
     dataset_path = os.path.abspath(dataset_path)
-    for postfix in ('train', 'val'):
-        if dataset_path.endswith(postfix):
-            dataset_path = dataset_path[:-len(postfix)]
-    
-    dataset_train = ImageNetDataset(imagenet_folder=dataset_path, transform=trans_train, train=True)
-    print_transform(trans_train, '[pre-train]')
-    return dataset_train
+    if not os.path.exists(dataset_path):
+         raise ValueError(f"Dataset path does not exist: {dataset_path}")
 
+    # Use the custom flat loader
+    dataset_train = FlatFolderDataset(root=dataset_path, transform=trans_train)
+    
+    return dataset_train
 
 def print_transform(transform, s):
     print(f'Transform {s} = ')
