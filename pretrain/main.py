@@ -156,6 +156,7 @@ def main_pt():
                 itrt_train.set_epoch(ep)
             
             # stats = pre_train_one_ep(ep, args, tb_lg, itrt_train, iters_train, model, optimizer)
+            misc.save_checkpoint_model_weights_only(f'checkpoint.ckpt', args, model_without_ddp.sparse_encoder.sp_cnn.state_dict())
             stats = pre_train_one_ep(ep, args, itrt_train, iters_train, model, optimizer)
             last_loss = stats['last_loss']
             min_loss = min(min_loss, last_loss)
